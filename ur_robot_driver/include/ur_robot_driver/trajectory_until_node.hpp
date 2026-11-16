@@ -41,7 +41,16 @@
 #ifndef UR_ROBOT_DRIVER__TRAJECTORY_UNTIL_NODE_HPP_
 #define UR_ROBOT_DRIVER__TRAJECTORY_UNTIL_NODE_HPP_
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <variant>
 
 #include <rclcpp/rclcpp.hpp>
@@ -80,6 +89,28 @@ private:
 
   template <class ActionType, class ClientType>
   void send_until_goal(std::shared_ptr<const TrajectoryUntilAction::Goal> goal);
+
+  // PATCH(lpreol #103): the arm-after-lead-in path. See the header comment and the definitions.
+  rclcpp_action::GoalResponse accept_and_arm_later(std::shared_ptr<const TrajectoryUntilAction::Goal> goal,
+                                                   double lead_in_s);
+  void arm_tool_contact(uint64_t generation);
+  void fail_arming(const std::string& error_string);
+  bool arm_after_lead_in_{ false };
+  double arm_lead_margin_s_{ 0.02 };
+  double arm_accept_timeout_s_{ 0.05 };
+  // Server callback group only (goal_received / goal_accepted / goal_cancelled / the arm timer share
+  // that MutuallyExclusive group, so these need no lock).
+  rclcpp::TimerBase::SharedPtr arm_timer_;
+  std::chrono::steady_clock::time_point arm_trajectory_sent_at_;
+  double arm_lead_in_s_{ 0.0 };
+  // GUARDED BY mutex_child_goals_: an arming still owed to the goal being served, which goal that is,
+  // and whether its parent was accepted. reset_node() clears arm_pending_ in the same critical
+  // section that disarms expecting_until_goal_, so an arming that has not happened yet can never
+  // happen after the goal ended.
+  bool arm_pending_{ false };
+  bool arm_parent_accepted_{ false };
+  bool arm_cancel_requested_{ false };
+  uint64_t arm_generation_{ 0 };
 
   template <class T>
   void until_response_callback(const typename rclcpp_action::ClientGoalHandle<T>::SharedPtr& goal_handle);
@@ -125,11 +156,65 @@ private:
 
   std::atomic<bool> trajectory_accepted_;
   std::atomic<bool> until_accepted_;
+  // PATCH(lpreol #103): the until goal was explicitly refused. Only the arm-after-lead-in path waits
+  // on it (so a refusal fails closed at once, not at its deadline); reset per goal in reset_node().
+  std::atomic<bool> until_rejected_{ false };
 
   std::condition_variable cv_until_;
   std::condition_variable cv_trajectory_;
   std::mutex mutex_until;
   std::mutex mutex_trajectory;
+
+  // PATCH(lpreol #77): serialises access to server_goal_handle_ ACROSS THE ONE REAL CONCURRENCY
+  // BOUNDARY in this node — the server callback group (goal_received / goal_accepted /
+  // goal_cancelled) against the clients group (results / feedback). ⛔ It is NOT the two result
+  // callbacks racing each other: both clients live in the same MutuallyExclusive group, so those
+  // two are strictly serialised and cannot both be in report_goal(). Held only for the claim/clear,
+  // never across reset_node() or an rclcpp_action call, so it cannot deadlock.
+  // ⚠️ This mutex is not what prevents the production crash — terminate_goal() is; it closes a
+  // latent race. The child handles and the client variant are covered SEPARATELY, by
+  // mutex_child_goals_ below (#81) — they were an open hole when this comment was first written.
+  std::mutex mutex_server_goal_;
+
+  // PATCH(lpreol #77): take ownership of the server goal handle, or nullptr if another callback got
+  // there first. The FIRST result terminalises the goal; every later one is a genuine no-op.
+  std::shared_ptr<rclcpp_action::ServerGoalHandle<TrajectoryUntilAction>> claim_server_goal();
+
+  // PATCH(lpreol #81): THE lock for the child goal state — current_until_goal_handle_,
+  // current_trajectory_goal_handle_, until_action_client_variant and expecting_until_goal_.
+  // ⚠️ ONE DOCUMENTED EXEMPTION: goal_received_callback reads the variant unlocked (the
+  // wait_for_action_server visit, the holds_alternative check, and send_until_goal's async_send_goal).
+  // Those run on the SERVER group, which is also the only writer (assign_until_action_client), and
+  // that group is MutuallyExclusive — so they are same-thread, not a race. Anything reaching the
+  // variant from the CLIENTS group must take this lock.
+  // goal_cancelled_callback reads these from the SERVER callback group while the response and
+  // result callbacks write them from the CLIENTS group, which is the one boundary in this node
+  // where two callbacks genuinely run at once. Order: mutex_until / mutex_trajectory (outer) →
+  // this (inner). ⭐ Never held across an rclcpp_action call: snapshot under it, act outside.
+  std::mutex mutex_child_goals_;
+
+  // PATCH(lpreol #81): is an until goal still wanted? Plain bool, GUARDED BY mutex_child_goals_ —
+  // an atomic would not help, because the bug is check-then-act, not torn reads.
+  bool expecting_until_goal_{ false };
+
+  // PATCH(lpreol #81): claim a child result for the goal we are actually serving. Compares the id
+  // and clears the member in ONE critical section; returns false for a stale or unexpected result.
+  template <typename HandlePtr>
+  bool claim_child_result(HandlePtr& member, const rclcpp_action::GoalUUID& goal_id, const char* which);
+
+  // PATCH(lpreol #81): cancel a specific until goal. Takes the handle explicitly so callers cannot
+  // re-read the member after releasing the lock.
+  void cancel_until_handle(const rclcpp_action::ClientGoalHandle<ur_msgs::action::ToolContact>::SharedPtr& handle);
+
+  // PATCH(lpreol #77): the terminal transition, made legal and non-fatal. See the definition.
+  enum class GoalOutcome
+  {
+    kSucceed,
+    kAbort,
+    kCancel
+  };
+  void terminate_goal(const std::shared_ptr<rclcpp_action::ServerGoalHandle<TrajectoryUntilAction>>& handle,
+                      GoalOutcome outcome);
 };
 
 }  // namespace ur_robot_driver
