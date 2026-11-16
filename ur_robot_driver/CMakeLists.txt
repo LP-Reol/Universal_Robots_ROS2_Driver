@@ -200,6 +200,12 @@ install(DIRECTORY config launch urdf
 ament_package()
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_gmock REQUIRED)
+  ament_add_gmock(test_tool_contact_request
+    test/test_tool_contact_request.cpp
+  )
+  target_include_directories(test_tool_contact_request PRIVATE include)
+
   find_package(ur_controllers REQUIRED)
   find_package(ur_description REQUIRED)
   find_package(ur_msgs REQUIRED)
