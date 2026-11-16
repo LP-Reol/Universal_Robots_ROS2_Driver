@@ -41,11 +41,16 @@
 #ifndef UR_ROBOT_DRIVER__TRAJECTORY_UNTIL_NODE_HPP_
 #define UR_ROBOT_DRIVER__TRAJECTORY_UNTIL_NODE_HPP_
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <variant>
 
 #include <rclcpp/rclcpp.hpp>
@@ -84,6 +89,28 @@ private:
 
   template <class ActionType, class ClientType>
   void send_until_goal(std::shared_ptr<const TrajectoryUntilAction::Goal> goal);
+
+  // PATCH(lpreol #103): the arm-after-lead-in path. See the header comment and the definitions.
+  rclcpp_action::GoalResponse accept_and_arm_later(std::shared_ptr<const TrajectoryUntilAction::Goal> goal,
+                                                   double lead_in_s);
+  void arm_tool_contact(uint64_t generation);
+  void fail_arming(const std::string& error_string);
+  bool arm_after_lead_in_{ false };
+  double arm_lead_margin_s_{ 0.02 };
+  double arm_accept_timeout_s_{ 0.05 };
+  // Server callback group only (goal_received / goal_accepted / goal_cancelled / the arm timer share
+  // that MutuallyExclusive group, so these need no lock).
+  rclcpp::TimerBase::SharedPtr arm_timer_;
+  std::chrono::steady_clock::time_point arm_trajectory_sent_at_;
+  double arm_lead_in_s_{ 0.0 };
+  // GUARDED BY mutex_child_goals_: an arming still owed to the goal being served, which goal that is,
+  // and whether its parent was accepted. reset_node() clears arm_pending_ in the same critical
+  // section that disarms expecting_until_goal_, so an arming that has not happened yet can never
+  // happen after the goal ended.
+  bool arm_pending_{ false };
+  bool arm_parent_accepted_{ false };
+  bool arm_cancel_requested_{ false };
+  uint64_t arm_generation_{ 0 };
 
   template <class T>
   void until_response_callback(const typename rclcpp_action::ClientGoalHandle<T>::SharedPtr& goal_handle);
@@ -129,6 +156,9 @@ private:
 
   std::atomic<bool> trajectory_accepted_;
   std::atomic<bool> until_accepted_;
+  // PATCH(lpreol #103): the until goal was explicitly refused. Only the arm-after-lead-in path waits
+  // on it (so a refusal fails closed at once, not at its deadline); reset per goal in reset_node().
+  std::atomic<bool> until_rejected_{ false };
 
   std::condition_variable cv_until_;
   std::condition_variable cv_trajectory_;

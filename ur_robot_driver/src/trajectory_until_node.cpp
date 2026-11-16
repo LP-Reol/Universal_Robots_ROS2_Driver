@@ -52,6 +52,28 @@ using TrajectoryResult = rclcpp_action::ClientGoalHandle<control_msgs::action::F
 
 using namespace std::chrono_literals;
 
+namespace
+{
+// PATCH(lpreol #103): the arm-after-lead-in timing is all steady-clock arithmetic on seconds.
+std::chrono::steady_clock::duration to_steady(double seconds)
+{
+  return std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));
+}
+
+double ms_between(std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to)
+{
+  return std::chrono::duration<double, std::milli>(to - from).count();
+}
+
+// A number for an error string that travels in the result (no fixed-size message buffers).
+std::string num(double value, int decimals)
+{
+  char buffer[32];
+  std::snprintf(buffer, sizeof(buffer), "%.*f", decimals, value);
+  return buffer;
+}
+}  // namespace
+
 TrajectoryUntilNode::TrajectoryUntilNode(const rclcpp::NodeOptions& options)
   : Node("TrajectoryUntilNode", options)
   , server_goal_handle_(nullptr)
@@ -69,6 +91,23 @@ TrajectoryUntilNode::TrajectoryUntilNode(const rclcpp::NodeOptions& options)
 
   this->declare_parameter("motion_controller", "scaled_joint_trajectory_controller");
   std::string motion_controller = this->get_parameter("motion_controller").as_string();
+
+  // PATCH(lpreol #103): see the header comment. Off = the upstream arm-then-send order, unchanged.
+  arm_after_lead_in_ = this->declare_parameter<bool>("arm_after_lead_in", false);
+  // How long before the end of the lead-in the tool-contact goal is sent — covers the goal round
+  // trip and the controller's one-to-two cycles to START on the robot. A descent whose lead-in is not
+  // longer than this is armed the upstream way (before it is sent).
+  arm_lead_margin_s_ = std::max(0.0, this->declare_parameter<double>("arm_lead_margin_s", 0.02));
+  // The fail-closed budget, counted from the planned send: past it the cancel is requested. The
+  // descent can have been moving for at most (this − margin) by then — at 30 mm/s 0.9 mm with the
+  // defaults, before the JTC's cancel latency — so keep it well inside the shallowest real contact.
+  arm_accept_timeout_s_ = std::max(0.005, this->declare_parameter<double>("arm_accept_timeout_s", 0.05));
+  if (arm_after_lead_in_) {
+    RCLCPP_WARN(this->get_logger(), "arm_after_lead_in: tool contact is sent lead-in − %.3f s after each descent, "
+                                    "not before it (#103); cancelled if not accepted within %.3f s of that. "
+                                    "Descents with a lead-in <= %.3f s are armed first, as upstream.",
+                arm_lead_margin_s_, arm_accept_timeout_s_, arm_lead_margin_s_);
+  }
 
   // Initialize a trajectory action client, to a generic action that does not exist. This is remapped via ros-args when
   // launching the node
@@ -142,6 +181,22 @@ rclcpp_action::GoalResponse TrajectoryUntilNode::goal_received_callback(
     return rclcpp_action::GoalResponse::REJECT;
   }
 
+  // PATCH(lpreol #103): the opt-in order — trajectory first, tool contact shortly before the end of its
+  // lead-in. Only when there IS a lead-in longer than the margin: with no stationary hold to avoid,
+  // arming first (the upstream order) guards the descent from its very first cycle.
+  if (arm_after_lead_in_ && std::holds_alternative<TCClient>(until_action_client_variant)) {
+    const double lead_in_s = goal->trajectory.points.empty() ?
+                                 0.0 :
+                                 rclcpp::Duration(goal->trajectory.points.front().time_from_start).seconds();
+    if (lead_in_s > arm_lead_margin_s_) {
+      return accept_and_arm_later(goal, lead_in_s);
+    }
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 60000,
+                         "arm_after_lead_in: this descent's lead-in (%.3f s) is not longer than arm_lead_margin_s "
+                         "(%.3f s), so tool contact is armed before it is sent (upstream order).",
+                         lead_in_s, arm_lead_margin_s_);
+  }
+
   // Check until action server, send action goal to until-controller and wait for it to be accepted.
   if (std::holds_alternative<TCClient>(until_action_client_variant)) {
     send_until_goal<TCAction, TCClient>(goal);
@@ -198,7 +253,183 @@ void TrajectoryUntilNode::goal_accepted_callback(const std::shared_ptr<GoalHandl
     server_goal_handle_ = goal_handle;
   }
   RCLCPP_INFO(this->get_logger(), "Accepted goal");
-  return;
+
+  // PATCH(lpreol #103): on the arm-after-lead-in path, record that the parent exists — the arm timer
+  // (created in accept_and_arm_later, same group, so it cannot fire before this) checks it. On the
+  // upstream order nothing is pending and this is a no-op.
+  std::lock_guard<std::mutex> lock(mutex_child_goals_);
+  if (arm_pending_) {
+    arm_parent_accepted_ = true;
+  }
+}
+
+// PATCH(lpreol #103) — the opt-in order: trajectory first, then accept the parent, then (from the arm
+// timer) tool contact shortly before the end of the lead-in. goal_received_callback has already
+// confirmed both action servers, so the late arming needs no discovery, and it has checked that the
+// lead-in is longer than the margin.
+rclcpp_action::GoalResponse
+TrajectoryUntilNode::accept_and_arm_later(std::shared_ptr<const TrajectoryUntilAction::Goal> goal, double lead_in_s)
+{
+  // Stamped BEFORE the send: the JTC cannot start the trajectory before it has it, and trajectory time
+  // never runs faster than the wall clock (the speed slider only slows it), so the descent cannot
+  // leave its start before sent_at + lead-in. Every deadline below is measured from here, so no delay
+  // can push the fail-closed deadline past that + (timeout − margin). A JTC that accepts late only
+  // moves the arming EARLIER relative to motion; a late timer, or an acceptance seen late, can arm
+  // after motion has begun (WARN in arm_tool_contact) — but never past the deadline, where it fails
+  // closed.
+  arm_trajectory_sent_at_ = std::chrono::steady_clock::now();
+  arm_lead_in_s_ = lead_in_s;
+  send_trajectory_goal(goal);
+  bool trajectory_ok;
+  {
+    std::unique_lock<std::mutex> traj_lock(mutex_trajectory);
+    trajectory_ok = cv_trajectory_.wait_for(traj_lock, 1s, [this] { return trajectory_accepted_.load(); });
+  }
+  if (!trajectory_ok) {
+    reset_node();
+    return rclcpp_action::GoalResponse::REJECT;
+  }
+
+  uint64_t generation;
+  {
+    std::lock_guard<std::mutex> lock(mutex_child_goals_);
+    arm_pending_ = true;
+    arm_parent_accepted_ = false;
+    arm_cancel_requested_ = false;
+    generation = ++arm_generation_;
+  }
+  const auto arm_at = arm_trajectory_sent_at_ + to_steady(lead_in_s - arm_lead_margin_s_);
+  const auto delay = std::max<std::chrono::steady_clock::duration>(arm_at - std::chrono::steady_clock::now(),
+                                                                     std::chrono::milliseconds(1));
+  // One-shot, on the server group: it cannot run before this goal's goal_accepted_callback has
+  // returned (the same execute), nor concurrently with a cancel or the next goal. It cancels ITSELF,
+  // never the member, so a stale timer cannot touch the next goal's; a timer left from a goal that
+  // ended early is voided by arm_pending_/arm_generation_ in arm_tool_contact().
+  if (arm_timer_) {
+    arm_timer_->cancel();
+  }
+  arm_timer_ = this->create_wall_timer(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(delay),
+      [this, generation](rclcpp::TimerBase& timer) {
+        timer.cancel();
+        arm_tool_contact(generation);
+      },
+      server_callback_group);
+  return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+}
+
+// PATCH(lpreol #103) — send the tool-contact goal owed to the goal being served, and fail closed if it
+// is not accepted by the deadline. Runs on the server group, from the arm timer.
+void TrajectoryUntilNode::arm_tool_contact(uint64_t generation)
+{
+  TCClient client;
+  bool trajectory_running = false;
+  bool parent_accepted = false;
+  bool cancelling = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_child_goals_);
+    if (!arm_pending_ || generation != arm_generation_) {
+      return;  // the goal ended before its arming time: nothing is owed
+    }
+    arm_pending_ = false;
+    parent_accepted = arm_parent_accepted_;
+    trajectory_running = static_cast<bool>(current_trajectory_goal_handle_);
+    cancelling = arm_cancel_requested_;
+    if (parent_accepted && trajectory_running && !cancelling) {
+      // In the SAME critical section as the check: reset_node() clears arm_pending_ and
+      // expecting_until_goal_ together, so either it ran first (we returned above) or it runs after
+      // this, and the acceptance then cancels itself in until_response_callback.
+      expecting_until_goal_ = true;
+      client = std::get<TCClient>(until_action_client_variant);
+    }
+  }
+  if (!parent_accepted) {
+    // rclcpp_action never ran goal_accepted_callback for a goal we accepted: there is no parent to
+    // report to, and a descent nobody can stop must not keep running.
+    RCLCPP_ERROR(this->get_logger(), "The trajectory-until goal was never accepted, but its descent is running — "
+                                     "cancelling the descent (#103 arm-after-lead-in).");
+    reset_node();
+    return;
+  }
+  if (!trajectory_running) {
+    // The descent's own result was consumed before the parent was accepted, so nothing could report
+    // it then. The descent is over; arming now would leave tool contact armed on a standing arm.
+    fail_arming("Tool contact was never armed: the descent's own result arrived before this goal was accepted, "
+                "so it could not be reported.");
+    return;
+  }
+  if (cancelling) {
+    // Cancelled before its arming time, descent still running: goal_cancelled_callback has asked the
+    // JTC to cancel it, and that CANCELED result terminalises the goal. Nothing to arm.
+    return;
+  }
+
+  // Motion cannot begin before motion_start (see accept_and_arm_later). The deadline allows the
+  // descent at most (timeout − margin) of unguarded travel TIME past it — at 30 mm/s and the defaults
+  // 0.9 mm — before this node asks the JTC to cancel.
+  const auto motion_start = arm_trajectory_sent_at_ + to_steady(arm_lead_in_s_);
+  const auto deadline = motion_start + to_steady(arm_accept_timeout_s_ - arm_lead_margin_s_);
+  const auto sent = std::chrono::steady_clock::now();
+  if (sent >= deadline) {
+    // The timer itself came in past the budget (a descheduled process): never arm a descent that may
+    // already have run its unguarded allowance.
+    fail_arming("Could not arm tool contact in time: the arming ran " + num(ms_between(motion_start, sent), 1) +
+                " ms after the descent could have started moving, past the " +
+                num(arm_accept_timeout_s_ - arm_lead_margin_s_, 3) +
+                " s budget — cancelled the descent rather than let it run unguarded.");
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> until_lock(mutex_until);
+    until_rejected_ = false;
+  }
+  auto send_goal_options = rclcpp_action::Client<TCAction>::SendGoalOptions();
+  send_goal_options.goal_response_callback =
+      std::bind(&TrajectoryUntilNode::until_response_callback<TCAction>, this, std::placeholders::_1);
+  send_goal_options.result_callback =
+      std::bind(&TrajectoryUntilNode::until_result_callback<TCAction>, this, std::placeholders::_1);
+  client->async_send_goal(TCAction::Goal(), send_goal_options);
+
+  {
+    std::unique_lock<std::mutex> until_lock(mutex_until);
+    cv_until_.wait_until(until_lock, deadline,
+                         [this] { return until_accepted_.load() || until_rejected_.load(); });
+  }
+  const auto answered = std::chrono::steady_clock::now();
+  if (until_accepted_.load()) {
+    // Acceptance is not yet the robot armed (the controller writes START on its next cycle or two).
+    if (answered > motion_start) {
+      RCLCPP_WARN(this->get_logger(), "Tool contact accepted %.1f ms AFTER the descent could have started moving "
+                                      "(sent %.1f ms before it; lead-in %.3f s) — raise arm_lead_margin_s if this "
+                                      "recurs.",
+                  ms_between(motion_start, answered), ms_between(sent, motion_start), arm_lead_in_s_);
+    } else {
+      RCLCPP_INFO(this->get_logger(), "Tool contact accepted %.1f ms before the end of the %.3f s lead-in.",
+                  ms_between(answered, motion_start), arm_lead_in_s_);
+    }
+    return;
+  }
+  fail_arming(std::string("Could not arm tool contact for the descent (") +
+              (until_rejected_.load() ? "the tool-contact goal was rejected" : "no acceptance") + " " +
+              num(ms_between(sent, answered), 1) +
+              " ms after it was sent) — cancelled the descent rather than let it run unguarded.");
+}
+
+// PATCH(lpreol #103) — abort the goal being served because tool contact could not be armed for its
+// descent, and cancel the descent (reset_node). Losing the claim means a result is already
+// terminalising this goal and will reset the node itself.
+void TrajectoryUntilNode::fail_arming(const std::string& error_string)
+{
+  auto handle = claim_server_goal();
+  if (!handle) {
+    return;
+  }
+  prealloc_res_->until_condition_result = TrajectoryUntilAction::Result::NOT_TRIGGERED;
+  prealloc_res_->error_string = error_string;
+  terminate_goal(handle, GoalOutcome::kAbort);
+  RCLCPP_ERROR(this->get_logger(), "%s", prealloc_res_->error_string.c_str());
+  reset_node();
 }
 
 // If the trajectory_until action is canceled, it should cancel the until and trajectory actions, if any are running.
@@ -220,6 +451,11 @@ TrajectoryUntilNode::goal_cancelled_callback(const std::shared_ptr<GoalHandleTra
     std::lock_guard<std::mutex> lock(mutex_child_goals_);
     until_handle = current_until_goal_handle_;
     traj_handle = current_trajectory_goal_handle_;
+    // PATCH(lpreol #103): a descent being cancelled before its arming time must not get armed on
+    // the way out. Recorded, not cleared: the arm timer still runs, because if the descent's own
+    // result was already consumed (before the parent existed) nothing else would ever terminalise
+    // this goal. Same group as the timer, so ordered before or after it, never during.
+    arm_cancel_requested_ = true;
   }
   if (until_handle) {
     cancel_until_handle(until_handle);
@@ -317,6 +553,13 @@ void TrajectoryUntilNode::until_response_callback(
       }
     } else {
       RCLCPP_ERROR(this->get_logger(), "Until condition was rejected by server.");
+      // PATCH(lpreol #103): wakes the arm-after-lead-in wait at once. A refusal carries no goal id,
+      // so it only counts while an until goal is expected — a stale one cannot poison the next goal
+      // except by failing it closed, the safe direction.
+      std::lock_guard<std::mutex> child_guard(mutex_child_goals_);
+      if (expecting_until_goal_) {
+        until_rejected_ = true;
+      }
     }
   }
   cv_until_.notify_one();
@@ -602,6 +845,7 @@ void TrajectoryUntilNode::reset_node()
     current_until_goal_handle_ = nullptr;
     current_trajectory_goal_handle_ = nullptr;
     expecting_until_goal_ = false;
+    arm_pending_ = false;  // PATCH(lpreol #103): an arming owed to the goal that just ended is void
   }
   if (until_handle) {
     cancel_until_handle(until_handle);
@@ -618,8 +862,12 @@ void TrajectoryUntilNode::reset_node()
   }
   trajectory_accepted_ = false;
   until_accepted_ = false;
+  until_rejected_ = false;  // PATCH(lpreol #103)
   prealloc_res_ = std::make_shared<TrajectoryUntilAction::Result>(TrajectoryUntilAction::Result());
-  prealloc_fb_ = std::make_shared<TrajectoryUntilAction::Feedback>(TrajectoryUntilAction::Feedback());
+  // PATCH(lpreol #103): prealloc_fb_ is NOT reallocated here any more. trajectory_feedback_callback
+  // (clients group) writes it after copying the server handle, and fail_arming() runs this reset from
+  // the SERVER group — reassigning the shared_ptr under a concurrent write is a data race. Nothing is
+  // lost: every feedback overwrites all five fields.
 
   {
     std::lock_guard<std::mutex> lock(mutex_server_goal_);  // PATCH(lpreol #77)
