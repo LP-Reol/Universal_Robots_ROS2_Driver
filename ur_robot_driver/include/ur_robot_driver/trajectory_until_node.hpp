@@ -52,6 +52,7 @@
 #include <mutex>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
@@ -111,6 +112,20 @@ private:
   bool arm_parent_accepted_{ false };
   bool arm_cancel_requested_{ false };
   uint64_t arm_generation_{ 0 };
+
+  // PATCH(lpreol #115): the run-out hold. See start_run_out_hold() and the comment above
+  // run_out_hold_possible(). CLIENTS group only (the trajectory feedback and result callbacks, the
+  // hold's own callbacks and its timer share that MutuallyExclusive group), so these need no lock.
+  std::vector<std::string> measured_joint_names_;
+  std::vector<double> measured_positions_;
+  std::chrono::steady_clock::time_point measured_at_;
+  std::shared_ptr<rclcpp_action::ServerGoalHandle<TrajectoryUntilAction>> held_server_goal_;
+  std::chrono::steady_clock::time_point hold_sent_at_;
+  rclcpp::TimerBase::SharedPtr hold_timer_;
+  uint64_t hold_generation_{ 0 };
+  bool run_out_hold_possible();
+  bool start_run_out_hold(const std::shared_ptr<rclcpp_action::ServerGoalHandle<TrajectoryUntilAction>>& handle);
+  void finish_run_out(uint64_t generation, const std::string& problem);
 
   template <class T>
   void until_response_callback(const typename rclcpp_action::ClientGoalHandle<T>::SharedPtr& goal_handle);
@@ -176,9 +191,15 @@ private:
   // mutex_child_goals_ below (#81) — they were an open hole when this comment was first written.
   std::mutex mutex_server_goal_;
 
+  // PATCH(lpreol #115): a server goal claimed for the run-out hold and not yet terminalised. GUARDED BY
+  // mutex_server_goal_; goal_received_callback rejects a new goal while it is set, as it does while
+  // server_goal_handle_ is.
+  bool holding_server_goal_{ false };
+
   // PATCH(lpreol #77): take ownership of the server goal handle, or nullptr if another callback got
   // there first. The FIRST result terminalises the goal; every later one is a genuine no-op.
-  std::shared_ptr<rclcpp_action::ServerGoalHandle<TrajectoryUntilAction>> claim_server_goal();
+  // PATCH(lpreol #115): with hold, the goal is claimed as held in the same critical section.
+  std::shared_ptr<rclcpp_action::ServerGoalHandle<TrajectoryUntilAction>> claim_server_goal(bool hold = false);
 
   // PATCH(lpreol #81): THE lock for the child goal state — current_until_goal_handle_,
   // current_trajectory_goal_handle_, until_action_client_variant and expecting_until_goal_.

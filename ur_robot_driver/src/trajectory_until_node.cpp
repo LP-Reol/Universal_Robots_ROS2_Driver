@@ -72,6 +72,16 @@ std::string num(double value, int decimals)
   std::snprintf(buffer, sizeof(buffer), "%.*f", decimals, value);
   return buffer;
 }
+
+// PATCH(lpreol #115): the run-out hold. The hold point is the last measured position the JTC reported
+// in its feedback (action_monitor_rate, 20 Hz). The JTC interpolates to it from the position it
+// measures when it takes the goal, so a slightly stale point moves a following arm by at most the
+// distance it travelled since that feedback, spread over this time.
+constexpr double kRunOutHoldTimeS = 0.1;
+// Past this, tool contact is ended without the hold, as before this patch.
+constexpr auto kRunOutHoldTimeout = 500ms;
+// Feedback older than this is not trusted as the arm's position.
+constexpr auto kMeasuredMaxAge = 250ms;
 }  // namespace
 
 TrajectoryUntilNode::TrajectoryUntilNode(const rclcpp::NodeOptions& options)
@@ -158,7 +168,7 @@ rclcpp_action::GoalResponse TrajectoryUntilNode::goal_received_callback(
 {
   {
     std::lock_guard<std::mutex> lock(mutex_server_goal_);  // PATCH(lpreol #77)
-    if (server_goal_handle_) {
+    if (server_goal_handle_ || holding_server_goal_) {     // PATCH(lpreol #115): or still holding
       RCLCPP_ERROR(this->get_logger(), "Node is currently busy, rejecting action goal.");
       return rclcpp_action::GoalResponse::REJECT;
     }
@@ -582,6 +592,10 @@ void TrajectoryUntilNode::trajectory_feedback_callback(
     std::lock_guard<std::mutex> lock(mutex_server_goal_);
     handle = server_goal_handle_;
   }
+  // PATCH(lpreol #115): the arm's measured position, for the run-out hold (clients group, no lock).
+  measured_joint_names_ = feedback->joint_names;
+  measured_positions_ = feedback->actual.positions;
+  measured_at_ = std::chrono::steady_clock::now();
   if (handle) {
     prealloc_fb_->actual = feedback->actual;
     prealloc_fb_->desired = feedback->desired;
@@ -694,11 +708,14 @@ void TrajectoryUntilNode::until_result_callback(
 // that rcl_action rejects by throwing — uncaught, aborting a process the whole row depends on.
 // (returns GoalHandleTrajectoryUntil, the file-scope alias — the class's own TrajectoryUntilAction
 //  typedef is private, so it cannot be named in a return type ahead of the TrajectoryUntilNode:: scope)
-std::shared_ptr<GoalHandleTrajectoryUntil> TrajectoryUntilNode::claim_server_goal()
+std::shared_ptr<GoalHandleTrajectoryUntil> TrajectoryUntilNode::claim_server_goal(bool hold)
 {
   std::lock_guard<std::mutex> lock(mutex_server_goal_);
   auto handle = server_goal_handle_;
   server_goal_handle_ = nullptr;
+  if (handle && hold) {
+    holding_server_goal_ = true;  // PATCH(lpreol #115)
+  }
   return handle;
 }
 
@@ -742,16 +759,26 @@ void TrajectoryUntilNode::terminate_goal(
 
 void TrajectoryUntilNode::report_goal(TrajectoryResult result)
 {
+  // PATCH(lpreol #115): decided BEFORE the claim, so the goal is claimed as held in one step and
+  // goal_received_callback cannot accept a new goal between the claim and the hold.
+  const bool hold = result.code == rclcpp_action::ResultCode::SUCCEEDED && run_out_hold_possible();
   // PATCH(lpreol #77): see claim_server_goal(). Losing the claim means another callback is already
   // terminalising this goal and will reset the node — returning here keeps us off prealloc_res_
   // while it is being reallocated underneath us.
-  auto handle = claim_server_goal();
+  auto handle = claim_server_goal(hold);
   if (!handle) {
     return;
   }
   prealloc_res_->until_condition_result = TrajectoryUntilAction::Result::NOT_TRIGGERED;
   prealloc_res_->error_code = result.result->error_code;
   prealloc_res_->error_string = result.result->error_string;
+  if (hold) {
+    if (start_run_out_hold(handle)) {
+      return;  // finish_run_out() terminalises the goal and resets the node once the arm is held
+    }
+    std::lock_guard<std::mutex> lock(mutex_server_goal_);
+    holding_server_goal_ = false;  // no hold: end tool contact now, as before this patch
+  }
   switch (result.code) {
     case rclcpp_action::ResultCode::SUCCEEDED:
       terminate_goal(handle, GoalOutcome::kSucceed);
@@ -822,6 +849,127 @@ void TrajectoryUntilNode::report_goal(UntilResult result)
     RCLCPP_INFO(this->get_logger(), "Trajectory finished by triggering until condition.");
   }
   reset_node();
+}
+
+// PATCH(lpreol #115) — the run-out hold. When the robot stops the arm on a contact, its result can be
+// lost on the way to ROS (lpreol_cobot_ros2 #115). The descent then runs out its planned time and the
+// JTC reports success, and from then on it commands the trajectory's LAST point, the planned floor
+// (set_success_trajectory_point(), not the measured position a cancel holds). The robot is not
+// following while it is in tool contact (external_control.urscript: MODE_TOOL_IN_CONTACT, servo thread
+// killed); ending tool contact restarts its servo thread, which then drives the arm from where the
+// robot stopped it to the floor (2026-11-10, UR1 at conv_C1: 5.7 mm in ~55 ms, 178 N, protective stop
+// C157A1). So when a descent succeeds with tool contact still armed and no result, this node first
+// sends the JTC a one-point goal at the last measured position, and ends tool contact only once that
+// goal has finished (or after a timeout, as before this patch). A press where the robot detected
+// nothing has followed the descent to the floor; its hold point is up to one feedback period old, so
+// the hold can lift the arm back up the descent by what it travelled in that time (≤ 1.5 mm at
+// 30 mm/s). The parent goal's result is unchanged (succeeded, NOT_TRIGGERED); it is reported after
+// the hold.
+//
+// Part 1: is there tool contact to protect, and a position to hold at? Clients group (from
+// report_goal on a trajectory result).
+bool TrajectoryUntilNode::run_out_hold_possible()
+{
+  bool until_open;
+  {
+    std::lock_guard<std::mutex> lock(mutex_child_goals_);
+    until_open = static_cast<bool>(current_until_goal_handle_);
+  }
+  if (!until_open) {
+    return false;  // tool contact was never armed, or its result is already in: nothing to hold for
+  }
+  const auto age = std::chrono::steady_clock::now() - measured_at_;
+  if (measured_positions_.empty() || measured_positions_.size() != measured_joint_names_.size() ||
+      age > kMeasuredMaxAge) {
+    RCLCPP_ERROR(this->get_logger(), "The descent ran out with tool contact armed and no result, but there is no "
+                                     "recent measured position to hold the arm at (last feedback %.0f ms ago). "
+                                     "Ending tool contact without a hold (#115).",
+                 std::chrono::duration<double, std::milli>(age).count());
+    return false;
+  }
+  return true;
+}
+
+// PATCH(lpreol #115) — the run-out hold, part 2: send the JTC a one-point goal at the measured position.
+// The parent goal stays claimed (holding_server_goal_) until finish_run_out(), which runs from the hold's
+// response, its result or the timeout, whichever comes first; the generation voids the other two.
+bool TrajectoryUntilNode::start_run_out_hold(const std::shared_ptr<GoalHandleTrajectoryUntil>& handle)
+{
+  FollowJointTrajectory::Goal goal;
+  goal.trajectory.joint_names = measured_joint_names_;
+  trajectory_msgs::msg::JointTrajectoryPoint point;
+  point.positions = measured_positions_;
+  point.velocities.assign(measured_positions_.size(), 0.0);
+  point.time_from_start = rclcpp::Duration::from_seconds(kRunOutHoldTimeS);
+  goal.trajectory.points.push_back(point);
+
+  const uint64_t generation = ++hold_generation_;
+  held_server_goal_ = handle;
+  hold_sent_at_ = std::chrono::steady_clock::now();
+
+  auto options = rclcpp_action::Client<FollowJointTrajectory>::SendGoalOptions();
+  options.goal_response_callback =
+      [this, generation](const rclcpp_action::ClientGoalHandle<FollowJointTrajectory>::SharedPtr& goal_handle) {
+        if (!goal_handle) {
+          finish_run_out(generation, "the controller rejected the hold");
+        }
+      };
+  options.result_callback = [this, generation](const TrajectoryResult& result) {
+    finish_run_out(generation, result.code == rclcpp_action::ResultCode::SUCCEEDED ?
+                                   std::string() :
+                                   std::string("the hold ended ") + describe(result.code));
+  };
+  if (hold_timer_) {
+    hold_timer_->cancel();
+  }
+  hold_timer_ = this->create_wall_timer(
+      kRunOutHoldTimeout,
+      [this, generation](rclcpp::TimerBase& timer) {
+        timer.cancel();
+        finish_run_out(generation, "the hold did not finish within " +
+                                       num(std::chrono::duration<double>(kRunOutHoldTimeout).count(), 1) + " s");
+      },
+      clients_callback_group);
+
+  RCLCPP_WARN(this->get_logger(), "The descent ran out with tool contact armed and no result: holding the arm where it "
+                                  "was measured before ending tool contact, so it is not driven on to the descent's "
+                                  "end point (#115).");
+  try {
+    trajectory_action_client_->async_send_goal(goal, options);
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR(this->get_logger(), "Could not send the hold: %s", e.what());
+    hold_timer_->cancel();
+    held_server_goal_.reset();
+    ++hold_generation_;  // voids any callback of the failed send
+    return false;
+  }
+  return true;
+}
+
+// PATCH(lpreol #115) — the run-out hold, part 3: report the parent goal as before, then end tool contact
+// (reset_node). Clients group. An empty problem means the hold finished.
+void TrajectoryUntilNode::finish_run_out(uint64_t generation, const std::string& problem)
+{
+  if (generation != hold_generation_ || !held_server_goal_) {
+    return;  // this hold is already finished: a late response, result or timer
+  }
+  if (hold_timer_) {
+    hold_timer_->cancel();
+  }
+  auto handle = std::move(held_server_goal_);
+  held_server_goal_.reset();
+  const double held_ms = ms_between(hold_sent_at_, std::chrono::steady_clock::now());
+  if (problem.empty()) {
+    RCLCPP_INFO(this->get_logger(), "The arm is held where it was measured (%.1f ms); ending tool contact.", held_ms);
+  } else {
+    RCLCPP_ERROR(this->get_logger(), "Ending tool contact without the hold in place: %s (after %.1f ms).",
+                 problem.c_str(), held_ms);
+  }
+  terminate_goal(handle, GoalOutcome::kSucceed);
+  RCLCPP_INFO(this->get_logger(), "Trajectory finished successfully, did not trigger until condition.");
+  reset_node();
+  std::lock_guard<std::mutex> lock(mutex_server_goal_);
+  holding_server_goal_ = false;
 }
 
 // Reset all variables and cancel running actions, if any.
