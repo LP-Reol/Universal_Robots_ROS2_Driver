@@ -141,19 +141,40 @@ private:
   // callbacks racing each other: both clients live in the same MutuallyExclusive group, so those
   // two are strictly serialised and cannot both be in report_goal(). Held only for the claim/clear,
   // never across reset_node() or an rclcpp_action call, so it cannot deadlock.
-  // ⚠️ This mutex is not what prevents the production crash — terminate_goal() is. It closes a
-  // latent race, and it does NOT yet cover current_until_goal_handle_ /
-  // current_trajectory_goal_handle_ / until_action_client_variant, which goal_cancelled_callback
-  // reads across the same boundary. Same defect class, still open.
+  // ⚠️ This mutex is not what prevents the production crash — terminate_goal() is; it closes a
+  // latent race. The child handles and the client variant are covered SEPARATELY, by
+  // mutex_child_goals_ below (#81) — they were an open hole when this comment was first written.
   std::mutex mutex_server_goal_;
 
   // PATCH(lpreol #77): take ownership of the server goal handle, or nullptr if another callback got
   // there first. The FIRST result terminalises the goal; every later one is a genuine no-op.
   std::shared_ptr<rclcpp_action::ServerGoalHandle<TrajectoryUntilAction>> claim_server_goal();
 
-  // PATCH(lpreol #77): drop a child result that belongs to an already-finished goal. See definition.
+  // PATCH(lpreol #81): THE lock for the child goal state — current_until_goal_handle_,
+  // current_trajectory_goal_handle_, until_action_client_variant and expecting_until_goal_.
+  // ⚠️ ONE DOCUMENTED EXEMPTION: goal_received_callback reads the variant unlocked (the
+  // wait_for_action_server visit, the holds_alternative check, and send_until_goal's async_send_goal).
+  // Those run on the SERVER group, which is also the only writer (assign_until_action_client), and
+  // that group is MutuallyExclusive — so they are same-thread, not a race. Anything reaching the
+  // variant from the CLIENTS group must take this lock.
+  // goal_cancelled_callback reads these from the SERVER callback group while the response and
+  // result callbacks write them from the CLIENTS group, which is the one boundary in this node
+  // where two callbacks genuinely run at once. Order: mutex_until / mutex_trajectory (outer) →
+  // this (inner). ⭐ Never held across an rclcpp_action call: snapshot under it, act outside.
+  std::mutex mutex_child_goals_;
+
+  // PATCH(lpreol #81): is an until goal still wanted? Plain bool, GUARDED BY mutex_child_goals_ —
+  // an atomic would not help, because the bug is check-then-act, not torn reads.
+  bool expecting_until_goal_{ false };
+
+  // PATCH(lpreol #81): claim a child result for the goal we are actually serving. Compares the id
+  // and clears the member in ONE critical section; returns false for a stale or unexpected result.
   template <typename HandlePtr>
-  bool is_current_child_goal(HandlePtr current, const rclcpp_action::GoalUUID& goal_id, const char* which);
+  bool claim_child_result(HandlePtr& member, const rclcpp_action::GoalUUID& goal_id, const char* which);
+
+  // PATCH(lpreol #81): cancel a specific until goal. Takes the handle explicitly so callers cannot
+  // re-read the member after releasing the lock.
+  void cancel_until_handle(const rclcpp_action::ClientGoalHandle<ur_msgs::action::ToolContact>::SharedPtr& handle);
 
   // PATCH(lpreol #77): the terminal transition, made legal and non-fatal. See the definition.
   enum class GoalOutcome
