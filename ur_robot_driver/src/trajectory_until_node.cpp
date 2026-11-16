@@ -77,7 +77,7 @@ TrajectoryUntilNode::TrajectoryUntilNode(const rclcpp::NodeOptions& options)
                                                                                                       "trajectory",
                                                                                   clients_callback_group);
 
-  // Create action server to advertise the "/trajectory_until_node/execute"
+  // Create action server to advertise the "~/execute" action
   action_server_ = rclcpp_action::create_server<TrajectoryUntilAction>(
       this, "~/execute",
       std::bind(&TrajectoryUntilNode::goal_received_callback, this, std::placeholders::_1, std::placeholders::_2),
@@ -113,9 +113,12 @@ bool TrajectoryUntilNode::assign_until_action_client(std::shared_ptr<const Traje
 rclcpp_action::GoalResponse TrajectoryUntilNode::goal_received_callback(
     const rclcpp_action::GoalUUID& /* uuid */, std::shared_ptr<const TrajectoryUntilAction::Goal> goal)
 {
-  if (server_goal_handle_) {
-    RCLCPP_ERROR(this->get_logger(), "Node is currently busy, rejecting action goal.");
-    return rclcpp_action::GoalResponse::REJECT;
+  {
+    std::lock_guard<std::mutex> lock(mutex_server_goal_);  // PATCH(lpreol #77)
+    if (server_goal_handle_) {
+      RCLCPP_ERROR(this->get_logger(), "Node is currently busy, rejecting action goal.");
+      return rclcpp_action::GoalResponse::REJECT;
+    }
   }
 
   if (!assign_until_action_client(goal)) {
@@ -142,9 +145,11 @@ rclcpp_action::GoalResponse TrajectoryUntilNode::goal_received_callback(
     throw std::runtime_error("Until type not implemented. This should not happen.");
   }
 
-  // If it is not accepted within 1 second, it is assumed to be rejected. The predicate protects
-  // against the acceptance callback firing before this wait starts (the clients run on a separate
-  // callback group), which would otherwise lose the notification and burn the full timeout.
+  // PATCH(lpreol #36): predicated waits on the CORRECT condition variables.
+  // Upstream waits without a predicate (a notify that beats the wait is lost →
+  // full 1 s burn) and the trajectory wait blocks on cv_until_, which nothing
+  // on the trajectory path ever notifies (→ unconditional 1 s burn per goal).
+  // The 1 s timeouts remain as backstops only.
   {
     std::unique_lock<std::mutex> until_lock(mutex_until);
     if (!cv_until_.wait_for(until_lock, 1s, [this] { return until_accepted_.load(); })) {
@@ -152,8 +157,8 @@ rclcpp_action::GoalResponse TrajectoryUntilNode::goal_received_callback(
     }
   }
 
-  // Send action goal to trajectory controller and wait for it to be accepted. If it is not accepted
-  // within 1 second, it is assumed to be rejected.
+  // Send action goal to trajectory controller and wait for it to be accepted. If it is not accepted within 1 seconds,
+  // it is assumed to be rejected.
   send_trajectory_goal(goal);
   {
     std::unique_lock<std::mutex> traj_lock(mutex_trajectory);
@@ -169,7 +174,10 @@ rclcpp_action::GoalResponse TrajectoryUntilNode::goal_received_callback(
 // Save the server goal handle for later use.
 void TrajectoryUntilNode::goal_accepted_callback(const std::shared_ptr<GoalHandleTrajectoryUntil> goal_handle)
 {
-  server_goal_handle_ = goal_handle;
+  {
+    std::lock_guard<std::mutex> lock(mutex_server_goal_);  // PATCH(lpreol #77)
+    server_goal_handle_ = goal_handle;
+  }
   RCLCPP_INFO(this->get_logger(), "Accepted goal");
   return;
 }
@@ -179,11 +187,24 @@ rclcpp_action::CancelResponse
 TrajectoryUntilNode::goal_cancelled_callback(const std::shared_ptr<GoalHandleTrajectoryUntil> /* goal_handle */)
 {
   RCLCPP_INFO(this->get_logger(), "Cancel received. Cancelling trajectory-until action.");
-  if (current_until_goal_handle_) {
-    cancel_until_goal();
+  // PATCH(lpreol #77): async_cancel_goal THROWS exceptions::UnknownGoalHandleError (which derives
+  // std::invalid_argument, NOT RCLError) when the goal is unknown or has already reached a terminal
+  // state — and the client erases the goal as soon as its result callback has run. Racing result
+  // delivery here is normal, and an uncaught throw would abort the process: the very failure mode
+  // this file is being fixed for.
+  try {
+    if (current_until_goal_handle_) {
+      cancel_until_goal();
+    }
+  } catch (const std::exception& e) {
+    RCLCPP_DEBUG(this->get_logger(), "Until goal was already finished when we tried to cancel it: %s", e.what());
   }
-  if (current_trajectory_goal_handle_) {
-    trajectory_action_client_->async_cancel_goal(current_trajectory_goal_handle_);
+  try {
+    if (current_trajectory_goal_handle_) {
+      trajectory_action_client_->async_cancel_goal(current_trajectory_goal_handle_);
+    }
+  } catch (const std::exception& e) {
+    RCLCPP_DEBUG(this->get_logger(), "Trajectory goal was already finished when we tried to cancel it: %s", e.what());
   }
 
   return rclcpp_action::CancelResponse::ACCEPT;
@@ -262,22 +283,94 @@ void TrajectoryUntilNode::trajectory_feedback_callback(
     const rclcpp_action::ClientGoalHandle<FollowJointTrajectory>::SharedPtr& /* goal_handle */,
     const std::shared_ptr<const FollowJointTrajectory::Feedback> feedback)
 {
-  if (server_goal_handle_) {
+  // PATCH(lpreol #77): copy the handle under the lock instead of the original double-check, which
+  // could still be nulled by reset_node() between the test and the publish.
+  std::shared_ptr<rclcpp_action::ServerGoalHandle<TrajectoryUntilAction>> handle;
+  {
+    std::lock_guard<std::mutex> lock(mutex_server_goal_);
+    handle = server_goal_handle_;
+  }
+  if (handle) {
     prealloc_fb_->actual = feedback->actual;
     prealloc_fb_->desired = feedback->desired;
     prealloc_fb_->error = feedback->error;
     prealloc_fb_->header = feedback->header;
     prealloc_fb_->joint_names = feedback->joint_names;
-    if (server_goal_handle_) {
-      server_goal_handle_->publish_feedback(prealloc_fb_);
-    }
+    handle->publish_feedback(prealloc_fb_);
   }
 }
 
 // When a result is received from either trajectory or until condition, report it back to user
+namespace
+{
+// PATCH(lpreol #77): result codes are logged as names, not integers — the whole point is that a
+// human reads them out of a container log after a rare failure.
+const char* describe(rclcpp_action::ResultCode code)
+{
+  switch (code) {
+    case rclcpp_action::ResultCode::SUCCEEDED:
+      return "SUCCEEDED";
+    case rclcpp_action::ResultCode::ABORTED:
+      return "ABORTED";
+    case rclcpp_action::ResultCode::CANCELED:
+      return "CANCELED";
+    default:
+      return "UNKNOWN";
+  }
+}
+}  // namespace
+
+// PATCH(lpreol #77) — does this result belong to the child goal we are currently serving?
+//
+// Neither result callback used to ask. Both reset the current child handle and forwarded the result
+// to report_goal(), which terminalises whatever server goal happens to be current. That is wrong in
+// a way that bites precisely because the healthy path leaves a cancelled child behind on EVERY
+// press: after a contact, reset_node() cancels the surviving child, and its CANCELED result is
+// still in flight. It is normally dropped because server_goal_handle_ is already null — but
+// goal_received_callback only rejects while that pointer is non-null, so once it is cleared the
+// NEXT goal can be accepted (on the server callback group, which does run concurrently with this
+// one). A late result then terminalises a goal it knows nothing about.
+//
+// Comparing goal ids makes the stale result a no-op instead. It also protects the quieter half of
+// the bug: the unconditional reset() above used to clear the CURRENT goal's child handle on a stale
+// result, after which that child could no longer be cancelled at all.
+template <typename HandlePtr>
+bool TrajectoryUntilNode::is_current_child_goal(HandlePtr current, const rclcpp_action::GoalUUID& goal_id,
+                                                const char* which)
+{
+  // ⚠️ BY VALUE, deliberately. Taking the member by reference read it three times, and reset_node()
+  // can clear it between the null test and the dereference — a null deref on the hot result path.
+  // One copy, then work off that. (The copy itself still races with reset_node's unsynchronised
+  // write; mutex_child_goals_ in the follow-up closes that. This removes the deref.)
+  if (current && current->get_goal_id() == goal_id) {
+    return true;
+  }
+  if (!current) {
+    // The ORDINARY case, once per press: the healthy path cancels the surviving child in
+    // reset_node() and nulls the handle, so that child's CANCELED result always arrives with
+    // nothing current. Logging this at WARN would fire on every single press and bury the real
+    // signal — which is a mismatched id, below.
+    RCLCPP_DEBUG(this->get_logger(), "Dropping a %s result for goal %s: no %s goal is being served.", which,
+                 rclcpp_action::to_string(goal_id).c_str(), which);
+    return false;
+  }
+  RCLCPP_WARN(this->get_logger(),
+              "Ignoring a %s result for goal %s: it is not the %s goal this node is currently serving (%s). A late "
+              "result from an already-finished goal must not terminalise the current one.",
+              which, rclcpp_action::to_string(goal_id).c_str(), which,
+              rclcpp_action::to_string(current->get_goal_id()).c_str());
+  return false;
+}
+
 void TrajectoryUntilNode::trajectory_result_callback(const TrajectoryResult& result)
 {
-  RCLCPP_INFO(this->get_logger(), "Trajectory result received.");
+  // PATCH(lpreol #77): the result code and goal id are the two facts that were missing when this
+  // node aborted in production, and they cost nothing to log once per goal.
+  RCLCPP_INFO(this->get_logger(), "Trajectory result received: code=%s goal=%s.", describe(result.code),
+              rclcpp_action::to_string(result.goal_id).c_str());
+  if (!is_current_child_goal(current_trajectory_goal_handle_, result.goal_id, "trajectory")) {
+    return;
+  }
   current_trajectory_goal_handle_.reset();
   report_goal(result);
 }
@@ -286,57 +379,115 @@ template <class T>
 void TrajectoryUntilNode::until_result_callback(
     const typename rclcpp_action::ClientGoalHandle<T>::WrappedResult& result)
 {
-  RCLCPP_INFO(this->get_logger(), "Until result received.");
+  // PATCH(lpreol #77): see trajectory_result_callback. This is the callback that was logging bare
+  // "Until result received." microseconds before the process died, with no way to tell afterwards
+  // which goal it belonged to or what code it carried.
+  RCLCPP_INFO(this->get_logger(), "Until result received: code=%s goal=%s.", describe(result.code),
+              rclcpp_action::to_string(result.goal_id).c_str());
+  if (!is_current_child_goal(current_until_goal_handle_, result.goal_id, "until")) {
+    return;
+  }
   current_until_goal_handle_.reset();
   report_goal(result);
 }
 
+// PATCH(lpreol #77) — claim the server goal for terminalisation, exactly once.
+//
+// ⛔ NOT because the two result callbacks race: they share one MutuallyExclusive group and are
+// strictly serialised. The original bare `if (server_goal_handle_)` was in fact deterministically
+// safe on the normal contact path — reset_node() nulls the pointer on the same serialised thread
+// that later processes the cancelled child's CANCELED result, so the null is ordered before it.
+//
+// The claim earns its place for the OTHER two reasons. It makes single-terminalisation explicit
+// even under a sequential double result, and it keeps the loser off prealloc_res_ while the winner's
+// reset_node() reallocates it. What actually kept the crash alive was terminate_goal()'s absence:
+// a child result carrying CANCELED, forwarded to a parent still EXECUTING, is an illegal transition
+// that rcl_action rejects by throwing — uncaught, aborting a process the whole row depends on.
+// (returns GoalHandleTrajectoryUntil, the file-scope alias — the class's own TrajectoryUntilAction
+//  typedef is private, so it cannot be named in a return type ahead of the TrajectoryUntilNode:: scope)
+std::shared_ptr<GoalHandleTrajectoryUntil> TrajectoryUntilNode::claim_server_goal()
+{
+  std::lock_guard<std::mutex> lock(mutex_server_goal_);
+  auto handle = server_goal_handle_;
+  server_goal_handle_ = nullptr;
+  return handle;
+}
+
+// PATCH(lpreol #77) — terminalise legally, and never take the process down if we get it wrong.
+//
+// rcl_action only permits EXECUTING → CANCELING → CANCELED, so canceled() is legal only once the
+// server goal has itself accepted a cancel request. A CANCELED result from a CHILD action says
+// nothing about the parent's state — the child is routinely cancelled by reset_node() on the normal
+// success path — so it must not be forwarded blindly. Anything still EXECUTING is aborted instead,
+// which is the honest report: the goal did not complete.
+//
+// The try/catch is the backstop. A terminal transition that rcl_action rejects should fail THIS
+// goal, not kill a node the whole row depends on.
+void TrajectoryUntilNode::terminate_goal(
+    const std::shared_ptr<rclcpp_action::ServerGoalHandle<TrajectoryUntilAction>>& handle, GoalOutcome outcome)
+{
+  try {
+    switch (outcome) {
+      case GoalOutcome::kSucceed:
+        handle->succeed(prealloc_res_);
+        break;
+      case GoalOutcome::kAbort:
+        handle->abort(prealloc_res_);
+        break;
+      case GoalOutcome::kCancel:
+        if (handle->is_canceling()) {
+          handle->canceled(prealloc_res_);
+        } else {
+          RCLCPP_WARN(this->get_logger(), "A child action reported CANCELED but this goal was never cancelled; "
+                                          "aborting it instead of forcing an illegal terminal transition.");
+          handle->abort(prealloc_res_);
+        }
+        break;
+    }
+  } catch (const rclcpp::exceptions::RCLError& e) {
+    RCLCPP_ERROR(this->get_logger(), "Could not terminalise the trajectory-until goal: %s. The goal is abandoned; "
+                                     "the node stays up.",
+                 e.what());
+  }
+}
+
 void TrajectoryUntilNode::report_goal(TrajectoryResult result)
 {
-  if (server_goal_handle_) {
-    prealloc_res_->until_condition_result = TrajectoryUntilAction::Result::NOT_TRIGGERED;
-    prealloc_res_->error_code = result.result->error_code;
-    prealloc_res_->error_string = result.result->error_string;
-    try {
-      switch (result.code) {
-        case rclcpp_action::ResultCode::SUCCEEDED:
-          server_goal_handle_->succeed(prealloc_res_);
-          break;
+  // PATCH(lpreol #77): see claim_server_goal(). Losing the claim means another callback is already
+  // terminalising this goal and will reset the node — returning here keeps us off prealloc_res_
+  // while it is being reallocated underneath us.
+  auto handle = claim_server_goal();
+  if (!handle) {
+    return;
+  }
+  prealloc_res_->until_condition_result = TrajectoryUntilAction::Result::NOT_TRIGGERED;
+  prealloc_res_->error_code = result.result->error_code;
+  prealloc_res_->error_string = result.result->error_string;
+  switch (result.code) {
+    case rclcpp_action::ResultCode::SUCCEEDED:
+      terminate_goal(handle, GoalOutcome::kSucceed);
+      break;
 
-        case rclcpp_action::ResultCode::ABORTED:
-          prealloc_res_->error_string += " Trajectory action was aborted. Aborting goal.";
-          server_goal_handle_->abort(prealloc_res_);
-          break;
+    case rclcpp_action::ResultCode::ABORTED:
+      prealloc_res_->error_string += " Trajectory action was aborted. Aborting goal.";
+      terminate_goal(handle, GoalOutcome::kAbort);
+      break;
 
-        case rclcpp_action::ResultCode::CANCELED:
-          prealloc_res_->error_string += " Trajectory action was canceled.";
-          if (server_goal_handle_->is_canceling()) {
-            server_goal_handle_->canceled(prealloc_res_);
-          } else {
-            RCLCPP_WARN(this->get_logger(), "The trajectory action reported CANCELED, aborting Move Until Contact "
-                                            "action.");
-            prealloc_res_->error_string += " Goal was not canceling; aborting.";
-            server_goal_handle_->abort(prealloc_res_);
-          }
-          break;
+    case rclcpp_action::ResultCode::CANCELED:
+      prealloc_res_->error_string += " Trajectory action was canceled.";
+      terminate_goal(handle, GoalOutcome::kCancel);
+      break;
 
-        default:
-          prealloc_res_->error_string += " Unknown result code received from trajectory action, this should not "
-                                         "happen. "
-                                         "Aborting goal.";
-          server_goal_handle_->abort(prealloc_res_);
-          break;
-      }
-    } catch (const rclcpp::exceptions::RCLError& e) {
-      // The goal reached a terminal state on another path first; losing that race must not
-      // terminate the node.
-      RCLCPP_ERROR(this->get_logger(), "Could not terminate the goal: %s", e.what());
-    }
-    if (result.code != rclcpp_action::ResultCode::SUCCEEDED) {
-      RCLCPP_ERROR(this->get_logger(), "%s", prealloc_res_->error_string.c_str());
-    } else {
-      RCLCPP_INFO(this->get_logger(), "Trajectory finished successfully, did not trigger until condition.");
-    }
+    default:
+      prealloc_res_->error_string += " Unknown result code received from trajectory action, this should not happen. "
+                                     "Aborting goal.";
+      terminate_goal(handle, GoalOutcome::kAbort);
+      break;
+  }
+  if (result.code != rclcpp_action::ResultCode::SUCCEEDED) {
+    RCLCPP_ERROR(this->get_logger(), "%s", prealloc_res_->error_string.c_str());
+  } else {
+    RCLCPP_INFO(this->get_logger(), "Trajectory finished successfully, did not trigger until condition.");
   }
   reset_node();
 }
@@ -344,50 +495,42 @@ void TrajectoryUntilNode::report_goal(TrajectoryResult result)
 template <typename UntilResult>
 void TrajectoryUntilNode::report_goal(UntilResult result)
 {
-  if (server_goal_handle_) {
-    try {
-      switch (result.code) {
-        case rclcpp_action::ResultCode::SUCCEEDED:
-          prealloc_res_->error_code = TrajectoryUntilAction::Result::SUCCESSFUL;
-          prealloc_res_->until_condition_result = TrajectoryUntilAction::Result::TRIGGERED;
-          prealloc_res_->error_string += "Trajectory finished successfully by triggering until condition.";
-          server_goal_handle_->succeed(prealloc_res_);
-          break;
+  // PATCH(lpreol #77): this is the overload that crashed the node in production — the tool-contact
+  // result arriving as CANCELED while the server goal was still EXECUTING. See claim_server_goal().
+  auto handle = claim_server_goal();
+  if (!handle) {
+    return;
+  }
+  switch (result.code) {
+    case rclcpp_action::ResultCode::SUCCEEDED:
+      prealloc_res_->error_code = TrajectoryUntilAction::Result::SUCCESSFUL;
+      prealloc_res_->until_condition_result = TrajectoryUntilAction::Result::TRIGGERED;
+      prealloc_res_->error_string += "Trajectory finished successfully by triggering until condition.";
+      terminate_goal(handle, GoalOutcome::kSucceed);
+      break;
 
-        case rclcpp_action::ResultCode::ABORTED:
-          prealloc_res_->error_string += "Until action was aborted. Aborting goal.";
-          server_goal_handle_->abort(prealloc_res_);
-          break;
+    case rclcpp_action::ResultCode::ABORTED:
+      prealloc_res_->error_string += "Until action was aborted. Aborting goal.";
+      terminate_goal(handle, GoalOutcome::kAbort);
+      break;
 
-        case rclcpp_action::ResultCode::CANCELED:
-          prealloc_res_->error_string += "Until action was canceled.";
-          if (server_goal_handle_->is_canceling()) {
-            server_goal_handle_->canceled(prealloc_res_);
-          } else {
-            RCLCPP_WARN(this->get_logger(), "The until action reported CANCELED, aborting Move Until Contact action.");
-            prealloc_res_->error_string += " Goal was not canceling; aborting.";
-            server_goal_handle_->abort(prealloc_res_);
-          }
-          break;
+    case rclcpp_action::ResultCode::CANCELED:
+      prealloc_res_->error_string += "Until action was canceled.";
+      terminate_goal(handle, GoalOutcome::kCancel);
+      break;
 
-        default:
-          prealloc_res_->error_string += "Unknown result code received from until action, this should not happen. "
-                                         "Aborting "
-                                         "goal.";
-          server_goal_handle_->abort(prealloc_res_);
+    default:
+      prealloc_res_->error_string += "Unknown result code received from until action, this should not happen. "
+                                     "Aborting "
+                                     "goal.";
+      terminate_goal(handle, GoalOutcome::kAbort);
 
-          break;
-      }
-    } catch (const rclcpp::exceptions::RCLError& e) {
-      // The goal reached a terminal state on another path first; losing that race must not
-      // terminate the node.
-      RCLCPP_ERROR(this->get_logger(), "Could not terminate the goal: %s", e.what());
-    }
-    if (result.code != rclcpp_action::ResultCode::SUCCEEDED) {
-      RCLCPP_ERROR(this->get_logger(), "%s", prealloc_res_->error_string.c_str());
-    } else {
-      RCLCPP_INFO(this->get_logger(), "Trajectory finished by triggering until condition.");
-    }
+      break;
+  }
+  if (result.code != rclcpp_action::ResultCode::SUCCEEDED) {
+    RCLCPP_ERROR(this->get_logger(), "%s", prealloc_res_->error_string.c_str());
+  } else {
+    RCLCPP_INFO(this->get_logger(), "Trajectory finished by triggering until condition.");
   }
   reset_node();
 }
@@ -395,11 +538,24 @@ void TrajectoryUntilNode::report_goal(UntilResult result)
 // Reset all variables and cancel running actions, if any.
 void TrajectoryUntilNode::reset_node()
 {
-  if (current_until_goal_handle_) {
-    cancel_until_goal();
+  // PATCH(lpreol #77): async_cancel_goal THROWS exceptions::UnknownGoalHandleError (which derives
+  // std::invalid_argument, NOT RCLError) when the goal is unknown or has already reached a terminal
+  // state — and the client erases the goal as soon as its result callback has run. Racing result
+  // delivery here is normal, and an uncaught throw would abort the process: the very failure mode
+  // this file is being fixed for.
+  try {
+    if (current_until_goal_handle_) {
+      cancel_until_goal();
+    }
+  } catch (const std::exception& e) {
+    RCLCPP_DEBUG(this->get_logger(), "Until goal was already finished when we tried to cancel it: %s", e.what());
   }
-  if (current_trajectory_goal_handle_) {
-    trajectory_action_client_->async_cancel_goal(current_trajectory_goal_handle_);
+  try {
+    if (current_trajectory_goal_handle_) {
+      trajectory_action_client_->async_cancel_goal(current_trajectory_goal_handle_);
+    }
+  } catch (const std::exception& e) {
+    RCLCPP_DEBUG(this->get_logger(), "Trajectory goal was already finished when we tried to cancel it: %s", e.what());
   }
   current_trajectory_goal_handle_ = nullptr;
   current_until_goal_handle_ = nullptr;
@@ -408,7 +564,10 @@ void TrajectoryUntilNode::reset_node()
   prealloc_res_ = std::make_shared<TrajectoryUntilAction::Result>(TrajectoryUntilAction::Result());
   prealloc_fb_ = std::make_shared<TrajectoryUntilAction::Feedback>(TrajectoryUntilAction::Feedback());
 
-  server_goal_handle_ = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(mutex_server_goal_);  // PATCH(lpreol #77)
+    server_goal_handle_ = nullptr;
+  }
 }
 
 // Cancel the action contained in the variant, regardless of what type it is.

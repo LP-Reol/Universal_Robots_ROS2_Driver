@@ -41,7 +41,11 @@
 #ifndef UR_ROBOT_DRIVER__TRAJECTORY_UNTIL_NODE_HPP_
 #define UR_ROBOT_DRIVER__TRAJECTORY_UNTIL_NODE_HPP_
 
+#include <atomic>
+#include <condition_variable>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <variant>
 
 #include <rclcpp/rclcpp.hpp>
@@ -130,6 +134,36 @@ private:
   std::condition_variable cv_trajectory_;
   std::mutex mutex_until;
   std::mutex mutex_trajectory;
+
+  // PATCH(lpreol #77): serialises access to server_goal_handle_ ACROSS THE ONE REAL CONCURRENCY
+  // BOUNDARY in this node — the server callback group (goal_received / goal_accepted /
+  // goal_cancelled) against the clients group (results / feedback). ⛔ It is NOT the two result
+  // callbacks racing each other: both clients live in the same MutuallyExclusive group, so those
+  // two are strictly serialised and cannot both be in report_goal(). Held only for the claim/clear,
+  // never across reset_node() or an rclcpp_action call, so it cannot deadlock.
+  // ⚠️ This mutex is not what prevents the production crash — terminate_goal() is. It closes a
+  // latent race, and it does NOT yet cover current_until_goal_handle_ /
+  // current_trajectory_goal_handle_ / until_action_client_variant, which goal_cancelled_callback
+  // reads across the same boundary. Same defect class, still open.
+  std::mutex mutex_server_goal_;
+
+  // PATCH(lpreol #77): take ownership of the server goal handle, or nullptr if another callback got
+  // there first. The FIRST result terminalises the goal; every later one is a genuine no-op.
+  std::shared_ptr<rclcpp_action::ServerGoalHandle<TrajectoryUntilAction>> claim_server_goal();
+
+  // PATCH(lpreol #77): drop a child result that belongs to an already-finished goal. See definition.
+  template <typename HandlePtr>
+  bool is_current_child_goal(HandlePtr current, const rclcpp_action::GoalUUID& goal_id, const char* which);
+
+  // PATCH(lpreol #77): the terminal transition, made legal and non-fatal. See the definition.
+  enum class GoalOutcome
+  {
+    kSucceed,
+    kAbort,
+    kCancel
+  };
+  void terminate_goal(const std::shared_ptr<rclcpp_action::ServerGoalHandle<TrajectoryUntilAction>>& handle,
+                      GoalOutcome outcome);
 };
 
 }  // namespace ur_robot_driver
